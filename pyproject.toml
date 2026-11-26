@@ -1,0 +1,27 @@
+[project]
+name = "comfyui-platokeys"
+description = "Closed-form Plato's Key cross-encoder alignment (Procrustes rotation & regularized linear maps) for ComfyUI conditioning — e.g. Qwen3.5-2B into Qwen3.5-9B space for MOSS-Image."
+version = "0.1.0"
+license = { file = "LICENSE" }
+dependencies = ["safetensors"]
+
+[project.urls]
+Repository = "https://github.com/Nynxz/ComfyUI-PlatoKeys"
+
+[tool.comfy]
+PublisherId = "nynxz"
+DisplayName = "Plato Keys"
+Icon = ""
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
