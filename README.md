@@ -3,17 +3,21 @@
 Closed-form cross-encoder conditioning alignment for ComfyUI, based on Stanford Hazy Research's
 [**Plato's Key**](https://hazyresearch.stanford.edu/blog/2026-11-25-platos-key).
 
-Encode prompts with a **smaller, faster text encoder** (starting with **Qwen3.5-2B**, ~4.5 GB) and
-project its hidden states into a **larger target encoder's space** (**Qwen3.5-9B**, ~18 GB — the text
-encoder expected by **MOSS-Image**) with a single closed-form matrix multiply (`16 MB` `.safetensors`
-key, zero gradient descent, zero retraining of the diffusion model or text encoder).
+Encode prompts (and images via **Patch CLIP**) with a **different text encoder** — smaller/faster
+(e.g. **Qwen3.5-2B** for MOSS-Image or Krea 2) or stronger/larger (e.g. **Qwen3.5-9B** for Krea 2) —
+and project its hidden states into the target encoder's space with a single closed-form linear map
+(zero gradient descent, zero retraining of the diffusion model or text encoder).
+
+Supports both **single-layer** targets (MOSS-Image `Qwen3.5-9B`) and **multi-layer tap** targets
+(Krea 2 `Qwen3-VL-4B` 12-layer stack, including cross-tokenizer calibration via UTF-8 byte-span
+alignment).
 
 ## Pre-calibrated keys (Hugging Face)
 
 Download calibrated `.safetensors` keys from [**nynxz/PlatoKeys**](https://huggingface.co/nynxz/PlatoKeys)
 and place them in `ComfyUI/models/plato_keys/`:
 
-### Qwen3.5-2B → Qwen3.5-9B (`2048 → 4096`, MOSS-Image)
+### 1. MOSS-Image: Qwen3.5-2B → Qwen3.5-9B (`2048 → 4096`)
 
 Calibrated on 2,000 diverse prompts (75,116 train tokens / 5,710 held-out validation tokens):
 
@@ -25,31 +29,47 @@ Calibrated on 2,000 diverse prompts (75,116 train tokens / 5,710 held-out valida
 | **`qwen35_2b_to_qwen35_9b_moss_image_ridge_norm.safetensors`** | Closed-form Ridge + target variance scale | **0.8951** | **0.8402** | **0.8088** | 0.4497 | 0.7238 | **1.0092** | **0.9981** |
 | `qwen35_2b_to_qwen35_9b_moss_image_procrustes_pca256.safetensors` | Rank-256 PCA-Procrustes | 0.8375 | 0.7492 | 0.7109 | 0.5419 | 0.5991 | 0.8393 | 0.9855 |
 
-Reverse keys (`Qwen3.5-9B → Qwen3.5-2B`, reaching `0.9433` token cosine / `0.8384` R² with Ridge) are also available in the same Hugging Face repo.
+*(Reverse `Qwen3.5-9B → Qwen3.5-2B` keys reaching `0.9433` TokCos / `0.8384` R² are also hosted in the same repo.)*
+
+### 2. Krea 2 (12-layer tap): Qwen3.5-2B → Qwen3-VL-4B (`12×2048 → 12×2560`, smaller/faster)
+
+Cross-tokenizer aligned via UTF-8 byte spans (99.99% token alignment across Qwen3.5 248k vs Qwen3-VL 152k vocab), tapping 12 proportional layers `[1,3,5,7,9,11,13,15,17,19,21,23]` → Krea 2 `[2,5,8,11,14,17,20,23,26,29,32,35]`:
+
+| Key (`120 MB` fp16) | Method | TokCos | CtrCos | CntCos | RelL2 | R² | NormR | ChStdR |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `qwen35_2b_to_qwen3vl_4b_krea2_procrustes.safetensors` | Plato's Key (Procrustes + LS scale) | 0.9008 | 0.7954 | 0.7920 | 0.4443 | 0.5965 | 0.9168 | 0.9711 |
+| `qwen35_2b_to_qwen3vl_4b_krea2_procrustes_norm.safetensors` | Plato's Key (Procrustes + variance scale) | 0.8914 | 0.7954 | 0.7920 | 0.4817 | 0.5258 | 1.0360 | 0.9711 |
+| **`qwen35_2b_to_qwen3vl_4b_krea2_ridge.safetensors`** | Closed-form Ridge | **0.9352** | **0.8638** | **0.8573** | **0.3548** | **0.7412** | 0.9377 | **0.9977** |
+| **`qwen35_2b_to_qwen3vl_4b_krea2_ridge_norm.safetensors`** | Closed-form Ridge + variance scale | **0.9309** | **0.8638** | **0.8573** | 0.3756 | 0.7097 | **1.0181** | **0.9977** |
+
+### 3. Krea 2 (12-layer tap): Qwen3.5-9B → Qwen3-VL-4B (`12×4096 → 12×2560`, bigger/stronger)
+
+Tapping 12 proportional layers `[2,4,7,10,12,15,18,20,23,26,28,31]` → Krea 2 `[2,5,8,11,14,17,20,23,26,29,32,35]`:
+
+| Key (`240 MB` fp16) | Method | TokCos | CtrCos | CntCos | RelL2 | R² | NormR | ChStdR |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `qwen35_9b_to_qwen3vl_4b_krea2_procrustes.safetensors` | Plato's Key (Procrustes + LS scale) | 0.9020 | 0.7932 | 0.7932 | 0.4417 | 0.6000 | 0.9155 | 0.9697 |
+| `qwen35_9b_to_qwen3vl_4b_krea2_procrustes_norm.safetensors` | Plato's Key (Procrustes + variance scale) | 0.8937 | 0.7932 | 0.7932 | 0.4769 | 0.5334 | 1.0285 | 0.9697 |
+| **`qwen35_9b_to_qwen3vl_4b_krea2_ridge.safetensors`** | Closed-form Ridge | **0.9432** | **0.8798** | **0.8759** | **0.3324** | **0.7723** | 0.9454 | **0.9978** |
+| **`qwen35_9b_to_qwen3vl_4b_krea2_ridge_norm.safetensors`** | Closed-form Ridge + variance scale | **0.9400** | **0.8798** | **0.8759** | 0.3500 | 0.7472 | **1.0164** | **0.9978** |
 
 ## How it works
 
-Because Qwen3.5-2B (`D = 2048`) and Qwen3.5-9B (`D = 4096`) share the exact same tokenizer
-(`qwen35_tokenizer`), every prompt produces identical token sequences of the same length $L$. Instead
-of aligning only a single pooled vector, we align **every token position 1-to-1** across thousands of
-shared prompts:
-
 1. **Streaming `float64` sufficient statistics** (`SufficientStats`): accumulates $(W, \sum x, \sum y,
-   X^\top X, X^\top Y, Y^\top Y)$ in constant ~224 MB RAM while loading the 2B and 9B models
-   *sequentially* (runs on Colab L4/A100 in `bf16`, or T4 16 GB with `--target-8bit`).
-2. **Exact semi-orthogonal Procrustes (no zero-padding waste)**: thin SVD directly on
-   $M_{xy} = X_c^\top Y_c \in \mathbb{R}^{2048 \times 4096}$ produces $R = U V^\top$ (`16 MB` in fp16
-   instead of `32 MB`) with $R R^\top = I_{2048}$.
-3. **Closed-form Ridge comparison**: Hazy Research showed unconstrained Ridge overfit on < 5,000
-   single-token samples; with 75,000+ paired token vectors ($N \approx 37 D$), regularized closed-form
-   Ridge matches Qwen3.5's anisotropic outlier channels (`ChStdR = 0.9981`) while staying a single
-   `16 MB` linear map at inference.
-4. **Automatic layer & chat-template parity for MOSS-Image**: stock ComfyUI `CLIPLoader` loads
-   `qwen3.5_2b` with `layer="hidden", layer_idx=-2` (unnormed) and `<think>\n</think>\n`, whereas
-   MOSS-Image expects `last_hidden_state` (`layer="last"`, final RMSNorm) and open `<think>\n`. Every
-   `.safetensors` PlatoKey embeds its calibrated layer and template in its header, and **Plato Key Encode**
-   temporarily overrides `options_default` on the underlying `SDClipModel` (restoring it in `finally`)
-   without modifying ComfyUI core.
+   X^\top X, X^\top Y, Y^\top Y)$ in constant memory while loading source and target encoders
+   *sequentially*.
+2. **Exact semi-orthogonal Procrustes (no zero-padding waste)** & **closed-form Ridge**: thin SVD on
+   $M_{xy} = X_c^\top Y_c$ gives $R = U V^\top$ with $R R^\top = I$; with 70,000+ paired token vectors,
+   scale-invariant closed-form Ridge matches anisotropic outlier channels (`ChStdR ≈ 0.998`) in a single
+   linear projection at inference.
+3. **Cross-tokenizer & multi-layer support**: for encoder families with different vocabularies
+   (Qwen3.5 248k vs Qwen3-VL 152k), `scripts/calibrate_comfy.py` aligns shared UTF-8 byte spans across
+   every prompt (~99.99% match rate) and stacks per-layer projections into a single `[N, d_target, d_source]`
+   `.safetensors` key that flattens `[B, 12, seq, 2560]` → `[B, seq, 30720]` identically to `krea2.py`.
+4. **Automatic layer, template, and prefix-strip parity**: every `.safetensors` PlatoKey embeds its
+   calibrated layer(s), `layer_norm_hidden_state`, chat template, and prefix-strip mode in its header.
+   **Plato Key Encode** and **Patch CLIP (Plato Key)** temporarily override `options_default` on the
+   underlying `SDClipModel` (restoring it in `finally`) without modifying ComfyUI core.
 
 ## Install
 
@@ -67,24 +87,50 @@ Place `.safetensors` keys from [nynxz/PlatoKeys](https://huggingface.co/nynxz/Pl
 | Node | Inputs → Outputs | Purpose |
 |---|---|---|
 | **Load Plato Key** | `key_name` → `PLATO_KEY`, `info` | Loads a `.safetensors` key from `models/plato_keys/` or `keys/` and outputs its metadata & held-out metrics. |
-| **Plato Key Encode** | `clip`, `plato_key`, `text` → `CONDITIONING` | Drop-in replacement for `CLIPTextEncode`. Honors the key's calibrated layer (`last`) and chat template (MOSS-Image) automatically, then projects conditioning into target space. |
-| **Apply Plato Key** | `conditioning`, `plato_key` → `CONDITIONING` | Projects any existing `CONDITIONING` wire directly (for custom pipelines or encoder pairs whose stock `CLIPTextEncode` already matches). |
+| **Patch CLIP (Plato Key)** | `clip`, `plato_key` → `CLIP` | Clones a `CLIP` and wraps `tokenize` / `encode_from_tokens*` / `clone` so **any downstream node** (`CLIPTextEncode`, Visual Fusion, Layout/Regions, `TextEncodeQwenImageEditPlus`, etc.) transparently taps the calibrated layer(s) and outputs target-space conditioning — including multi-layer Krea 2 and visual tokens. |
+| **Plato Key Encode** | `clip`, `plato_key`, `text` → `CONDITIONING` | Drop-in replacement for `CLIPTextEncode`. Honors the key's calibrated layer(s), chat template, and prefix strip automatically, then projects conditioning into target space. |
+| **Apply Plato Key** | `conditioning`, `plato_key` → `CONDITIONING` | Projects an existing single-layer `CONDITIONING` wire directly (for custom pipelines whose upstream encoder already matches the key's layer & template; for multi-layer keys like Krea 2, use **Patch CLIP (Plato Key)** or **Plato Key Encode** instead). |
 | **Compare Conditioning (Plato Key)** | `cond_mapped`, `cond_target` → `report` | Diagnostic node comparing mapped vs native target conditioning (shape, RMS ratio, per-token cosine, head/tail tokens, relative L2). |
 
-### MOSS-Image workflow with Qwen3.5-2B
+### Example 1: MOSS-Image with Qwen3.5-2B
 
 ```text
 UNETLoader (moss_image / kromoss) ────────────────────────────────────────┐
                                                                           ▼
-CLIPLoader (qwen3.5_2b_bf16.safetensors) ──┬──► Plato Key Encode (+) ──► KSampler
-Load Plato Key (qwen35_2b_to_9b_moss_*) ───┼──► Plato Key Encode (-) ────┘
+CLIPLoader (qwen3.5_2b_bf16, type=qwen_image) ─┬─► Plato Key Encode (+) ► KSampler
+Load Plato Key (qwen35_2b_to_9b_moss_ridge) ───┼─► Plato Key Encode (-) ──┘
                                                                           ▲
 VAELoader (flux2-vae.safetensors) ────────────────────────────────────────┘
 ```
 
-*(For distilled `cfg = 1` models like 8-step DMD2, `ConditioningZeroOut` can feed the negative slot.)*
+### Example 2: Krea 2 + Visual Fusion (or any downstream CLIP node) with Qwen3.5-2B or Qwen3.5-9B
+
+```text
+CLIPLoader (qwen3.5_9b / 2b, type=qwen_image) ─┐
+                                               ▼
+Load Plato Key (qwen35_*_to_qwen3vl_4b_krea2) ► Patch CLIP (Plato Key) ► Text Encode (Fusion) / CLIPTextEncode ► KSampler (Krea 2)
+```
+
+*(For distilled `cfg = 1` models like Krea 2 Turbo or MOSS DMD2, `ConditioningZeroOut` can feed the negative slot.)*
 
 ## Calibrating your own keys
+
+### Option A: Local ComfyUI checkpoints (supports multi-layer Krea 2, quantized `int8`/`fp8`, cross-tokenizer)
+
+```bash
+python scripts/calibrate_comfy.py \
+    --comfy-dir /path/to/ComfyUI \
+    --preset krea2 \
+    --source-ckpt /path/to/qwen3.5_9b_int8_convrot.safetensors \
+    --source-clip-type qwen_image \
+    --target-ckpt /path/to/qwen3vl_4b_bf16.safetensors \
+    --target-clip-type krea2 \
+    --num-prompts 2000 \
+    --out-dir keys \
+    --file-prefix qwen35_9b_to_qwen3vl_4b_krea2
+```
+
+### Option B: Hugging Face models (or Google Colab)
 
 Open [`colab/calibrate_qwen35_moss.ipynb`](colab/calibrate_qwen35_moss.ipynb) in Google Colab, or run locally:
 
@@ -97,7 +143,7 @@ python scripts/calibrate.py \
     --out-dir out/qwen35_moss
 ```
 
-Useful flags:
+Useful flags for `scripts/calibrate.py`:
 - `--target-8bit` / `--target-4bit`: fits Qwen3.5-9B on 16 GB GPUs (e.g. Colab T4).
 - `--also-reverse`: also fits and exports `target → source` keys from the same sufficient stats.
 - `--save-stats` / `--from-stats`: save sufficient stats (~224 MB) and refit on CPU in seconds.
@@ -115,4 +161,4 @@ ruff check .
 ## Credits
 
 - **Plato's Key**: Vivien Cheng, Jerry Liu, Morris Yau, and Chris Ré — [Stanford Hazy Research (2026)](https://hazyresearch.stanford.edu/blog/2026-11-25-platos-key).
-- **Qwen3.5** by Alibaba Qwen Team; **MOSS-Image** by OpenMOSS.
+- **Qwen3.5** & **Qwen3-VL** by Alibaba Qwen Team; **MOSS-Image** by OpenMOSS; **Krea 2** by Krea.

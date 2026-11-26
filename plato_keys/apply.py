@@ -1,11 +1,12 @@
 """Pure conditioning & tensor transformation for PlatoKeys (no ComfyUI imports).
 
-At inference time, every closed-form PlatoKey (Procrustes, variance-matched Procrustes, Ridge,
-PCA-Procrustes) applies the exact same fast affine map on the last dimension:
-
-    y_hat = mu_y + contrast * ((x - mu_x) @ weight.T)
-
-where `weight` has shape `[d_target, d_source]` and already carries the calibrated global scale.
+Supports both:
+  - Single-layer 2D keys (`weight: [d_target, d_source]`):
+        y_hat = mu_y + contrast * ((x - mu_x) @ weight.T)
+  - Multi-layer 3D stacked keys (`weight: [N, d_target, d_source]`, e.g. Krea 2's 12-layer tap):
+        accepts either 4D `[B, N, seq, d_source]` (direct from ComfyUI's multi-layer CLIP tap)
+        or 3D `[B, seq, N * d_source]` (pre-flattened), projects each layer independently via one
+        batched einsum, and optionally flattens to `[B, seq, N * d_target]`.
 """
 
 from __future__ import annotations
@@ -37,49 +38,70 @@ def apply_tensor(
     scale_multiplier: float = 1.0,
     norm_match: str = NORM_MATCH_OFF,
     target_token_rms: float | None = None,
+    flatten_layers: bool = False,
 ) -> torch.Tensor:
-    """Project `tensor` (`[..., d_source]`) into target space (`[..., d_target]`).
-
-    Always runs the projection in float32 for numerical accuracy (LLM outlier channels can exceed
-    fp16 dynamic range when subtracting `mu_x`), then casts back to `tensor.dtype`.
-
-    Controls:
-      - `contrast`: scales the deviation from the target mean `mu_y` (`1.0` = exact calibrated map;
-        `>1.0` sharpens deviation from average prompt; `<1.0` pulls toward average target prompt).
-      - `scale_multiplier`: global output multiplier (`1.0` = exact calibrated magnitude).
-      - `norm_match`:
-          * `"off"`: use exact calibrated output (recommended default).
-          * `"target_rms"`: rescale the whole tensor's RMS to the calibrated `target_token_rms`
-            (useful if a least-squares/Ridge map slightly under-scales energy).
-          * `"preserve_source_norm"`: rescale each token vector to match its input L2 norm.
-    """
-    d_target, d_source = weight.shape
-    if tensor.shape[-1] != d_source:
-        raise ValueError(
-            f"PlatoKey expects source embedding dimension {d_source}, but input conditioning has "
-            f"dimension {tensor.shape[-1]} (shape {tuple(tensor.shape)}). "
-            "Check that the wired text encoder matches the key's source model."
-        )
-
+    """Project `tensor` from source space into target space (single-layer 2D or multi-layer 3D)."""
     orig_dtype = tensor.dtype
     device = tensor.device
 
-    x32 = tensor.to(dtype=torch.float32)
-    w32 = weight.to(device=device, dtype=torch.float32)
-    mx32 = mu_x.to(device=device, dtype=torch.float32)
-    my32 = mu_y.to(device=device, dtype=torch.float32)
+    if weight.ndim == 2:
+        _, d_source = weight.shape
+        if tensor.shape[-1] != d_source:
+            raise ValueError(
+                f"PlatoKey expects source embedding dimension {d_source}, but input conditioning has "
+                f"dimension {tensor.shape[-1]} (shape {tuple(tensor.shape)}). "
+                "Check that the wired text encoder matches the key's source model."
+            )
+        x32 = tensor.to(dtype=torch.float32)
+        w32 = weight.to(device=device, dtype=torch.float32)
+        mx32 = mu_x.to(device=device, dtype=torch.float32)
+        my32 = mu_y.to(device=device, dtype=torch.float32)
 
-    projected = F.linear(x32 - mx32, w32)
-    if contrast != 1.0:
-        projected = projected * float(contrast)
-    out = projected + my32
+        projected = F.linear(x32 - mx32, w32)
+        if contrast != 1.0:
+            projected = projected * float(contrast)
+        out = projected + my32
+        src_for_norm = x32
+    elif weight.ndim == 3:
+        n_layers, d_target, d_source = weight.shape
+        if tensor.ndim == 4 and tensor.shape[1] == n_layers and tensor.shape[-1] == d_source:
+            x32 = tensor.to(dtype=torch.float32)  # [B, N, S, d_source]
+        elif tensor.ndim == 3 and tensor.shape[-1] == n_layers * d_source:
+            b, s, _ = tensor.shape
+            x32 = tensor.to(dtype=torch.float32).reshape(b, s, n_layers, d_source).permute(0, 2, 1, 3)
+        else:
+            hint = ""
+            if tensor.ndim == 3 and tensor.shape[-1] == d_source:
+                hint = (
+                    " This conditioning only has 1 layer instead of "
+                    f"{n_layers}. 'Apply Plato Key' cannot extract multiple hidden layers from an "
+                    "already-encoded CONDITIONING wire — replace 'Apply Plato Key' with "
+                    "'Patch CLIP (Plato Key)' BEFORE Visual Fusion / CLIPTextEncode "
+                    "(or use 'Plato Key Encode' for plain text)."
+                )
+            raise ValueError(
+                f"Multi-layer PlatoKey expects [B, {n_layers}, seq, {d_source}] or "
+                f"[B, seq, {n_layers * d_source}], got shape {tuple(tensor.shape)}.{hint}"
+            )
+
+        w32 = weight.to(device=device, dtype=torch.float32)  # [N, d_target, d_source]
+        mx32 = mu_x.to(device=device, dtype=torch.float32).view(1, n_layers, 1, d_source)
+        my32 = mu_y.to(device=device, dtype=torch.float32).view(1, n_layers, 1, d_target)
+
+        projected = torch.einsum("bnsd,ntd->bnst", x32 - mx32, w32)
+        if contrast != 1.0:
+            projected = projected * float(contrast)
+        out = projected + my32  # [B, N, S, d_target]
+        src_for_norm = x32
+    else:
+        raise ValueError(f"Unsupported PlatoKey weight ndim={weight.ndim}")
 
     if norm_match == NORM_MATCH_TARGET_RMS:
         if target_token_rms is not None and target_token_rms > 0.0:
             cur_rms = out.pow(2).mean().sqrt().clamp_min(_EPS)
             out = out * (float(target_token_rms) / cur_rms)
     elif norm_match == NORM_MATCH_SOURCE_NORM:
-        src_norm = x32.norm(dim=-1, keepdim=True)
+        src_norm = src_for_norm.norm(dim=-1, keepdim=True)
         out_norm = out.norm(dim=-1, keepdim=True).clamp_min(_EPS)
         out = out * (src_norm / out_norm)
     elif norm_match != NORM_MATCH_OFF:
@@ -87,6 +109,10 @@ def apply_tensor(
 
     if scale_multiplier != 1.0:
         out = out * float(scale_multiplier)
+
+    if weight.ndim == 3 and flatten_layers:
+        b, n, s, dt = out.shape
+        out = out.permute(0, 2, 1, 3).reshape(b, s, n * dt).contiguous()
 
     return out.to(dtype=orig_dtype)
 
@@ -100,17 +126,13 @@ def apply_conditioning(
     norm_match: str = NORM_MATCH_OFF,
     transform_pooled: bool = True,
 ) -> list:
-    """Apply a PlatoKey to every entry of a ComfyUI `CONDITIONING` list.
-
-    Each entry is `[cond_tensor, meta_dict]`. Returns a new list with copied metadata dicts so
-    upstream conditioning is never mutated in place.
-    """
+    """Apply a PlatoKey to every entry of a ComfyUI `CONDITIONING` list."""
     out = []
     for cond_tensor, meta in conditioning:
         x32 = cond_tensor.detach().to(device="cpu", dtype=torch.float32)
         in_rms = float(x32.pow(2).mean().sqrt().item())
-        mx32 = key.mu_x.detach().to(device="cpu", dtype=torch.float32)
-        if x32.shape[-1] == mx32.shape[0]:
+        if not key.is_multilayer and x32.shape[-1] == key.d_source:
+            mx32 = key.mu_x.detach().to(device="cpu", dtype=torch.float32)
             x_mean = x32.reshape(-1, x32.shape[-1]).mean(dim=0)
             cos_mux = float(
                 ((x_mean * mx32).sum() / (x_mean.norm().clamp_min(_EPS) * mx32.norm().clamp_min(_EPS))).item()
@@ -135,8 +157,8 @@ def apply_conditioning(
                 log.warning(
                     "[PlatoKeys] Input conditioning RMS %.4f differs strongly from calibrated "
                     "source_token_rms %.4f (%.2fx) for key %s (expected layer=%s, norm=%s). "
-                    "If you wired CLIPTextEncode -> Apply Plato Key on Qwen3.5-2B, switch to "
-                    "Plato Key Encode so the calibrated layer and chat template are applied.",
+                    "If you wired CLIPTextEncode -> Apply Plato Key, switch to Plato Key Encode "
+                    "so the calibrated layer(s) and chat template are applied.",
                     in_rms,
                     key.source_token_rms,
                     ratio,
@@ -153,6 +175,7 @@ def apply_conditioning(
             scale_multiplier=scale_multiplier,
             norm_match=norm_match,
             target_token_rms=key.target_token_rms,
+            flatten_layers=key.meta.flatten_layers,
         )
         new_meta = dict(meta) if meta else {}
         if transform_pooled and key.pooled_weight is not None:
@@ -211,8 +234,10 @@ def compare_conditioning(cond_a: list, cond_b: list) -> str:
             f"cos_min={float(cos.min()):.4f}, rel_l2={rel_l2:.4f}, "
             f"norm_ratio={float((na / nb).mean()):.4f}"
         )
-        # First 4 and last 4 tokens (attention sink + chat template boundaries)
-        per_tok = [f"t{i}:cos={float(cos[i]):.3f}(normA={float(na[i]):.1f}/B={float(nb[i]):.1f})" for i in range(min(4, va.shape[0]))]
+        per_tok = [
+            f"t{i}:cos={float(cos[i]):.3f}(normA={float(na[i]):.1f}/B={float(nb[i]):.1f})"
+            for i in range(min(4, va.shape[0]))
+        ]
         lines.append("Head: " + ", ".join(per_tok))
         if va.shape[0] > 4:
             tail = [
@@ -221,6 +246,6 @@ def compare_conditioning(cond_a: list, cond_b: list) -> str:
             ]
             lines.append("Tail: " + ", ".join(tail))
     else:
-        lines.append("Shapes differ — cannot compute token-by-token cosine (check template/tokenizer/layer).")
+        lines.append("Shapes differ (expected for cross-tokenizer pairs) — check RMS ratio and feature dims.")
 
     return "\n".join(lines)

@@ -45,6 +45,13 @@ QWEN35_DEFAULT_TEMPLATE = (
     "<|im_start|>user\n{prompt}<|im_end|>\n"
     "<|im_start|>assistant\n<think>\n</think>\n"
 )
+KREA2_TEMPLATE = (
+    "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, "
+    "quantity, text, spatial relationships of the objects and background:<|im_end|>\n"
+    "<|im_start|>user\n{prompt}<|im_end|>\n"
+    "<|im_start|>assistant\n"
+)
+KREA2_TAP_LAYERS = [2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35]
 
 
 @dataclass
@@ -61,6 +68,9 @@ class PlatoKeyMeta:
     target_layer_norm: bool = True
     source_template: str = ""  # Python format string with `{prompt}`, or "" to use CLIP's default
     strip_prompt: bool = True  # MOSS-Image strips leading/trailing whitespace before templating
+    strip_prefix_mode: str = ""  # "" (none) or "krea2_user" (strip system + <|im_start|>user\n prefix)
+    flatten_layers: bool = False  # True for multi-layer DiTs like Krea 2: [B, N, S, D] -> [B, S, N*D]
+    num_layers: int = 1  # 1 for single-layer keys, >1 for stacked per-layer keys (e.g. 12 for Krea 2)
     d_source: int = 0
     d_target: int = 0
     scale: float = 1.0
@@ -160,6 +170,9 @@ class PlatoKeyMeta:
             target_layer_norm=_bool("target_layer_norm", True),
             source_template=str(_get("source_template", "")),
             strip_prompt=_bool("strip_prompt", True),
+            strip_prefix_mode=str(_get("strip_prefix_mode", "")),
+            flatten_layers=_bool("flatten_layers", False),
+            num_layers=_int("num_layers", 1),
             d_source=_int("d_source", 0),
             d_target=_int("d_target", 0),
             scale=_float("scale", 1.0),
@@ -176,13 +189,14 @@ class PlatoKeyMeta:
 
 @dataclass
 class PlatoKey:
-    """In-memory cross-encoder alignment map."""
+    """In-memory cross-encoder alignment map (single-layer 2D or multi-layer 3D)."""
 
-    weight: torch.Tensor  # [d_target, d_source]
-    mu_x: torch.Tensor  # [d_source]
-    mu_y: torch.Tensor  # [d_target]
+    weight: torch.Tensor  # [d_target, d_source] or [num_layers, d_target, d_source]
+    mu_x: torch.Tensor  # [d_source] or [num_layers, d_source]
+    mu_y: torch.Tensor  # [d_target] or [num_layers, d_target]
     meta: PlatoKeyMeta = field(default_factory=PlatoKeyMeta)
     scale: float = 1.0
+    layer_scales: list[float] | None = None
     target_token_rms: float | None = None
     source_token_rms: float | None = None
     pooled_weight: torch.Tensor | None = None  # [d_pooled_target, d_pooled_source]
@@ -190,37 +204,64 @@ class PlatoKey:
     pooled_mu_y: torch.Tensor | None = None  # [d_pooled_target]
 
     def __post_init__(self) -> None:
-        if self.weight.ndim != 2:
-            raise ValueError(f"PlatoKey weight must be 2D [d_target, d_source], got {tuple(self.weight.shape)}")
-        d_target, d_source = self.weight.shape
-        if self.mu_x.shape != (d_source,):
-            raise ValueError(f"mu_x shape {tuple(self.mu_x.shape)} does not match d_source={d_source}")
-        if self.mu_y.shape != (d_target,):
-            raise ValueError(f"mu_y shape {tuple(self.mu_y.shape)} does not match d_target={d_target}")
+        if self.weight.ndim == 2:
+            d_target, d_source = self.weight.shape
+            n_layers = 1
+            if self.mu_x.shape != (d_source,):
+                raise ValueError(f"mu_x shape {tuple(self.mu_x.shape)} does not match d_source={d_source}")
+            if self.mu_y.shape != (d_target,):
+                raise ValueError(f"mu_y shape {tuple(self.mu_y.shape)} does not match d_target={d_target}")
+        elif self.weight.ndim == 3:
+            n_layers, d_target, d_source = self.weight.shape
+            if self.mu_x.shape != (n_layers, d_source):
+                raise ValueError(
+                    f"mu_x shape {tuple(self.mu_x.shape)} does not match (num_layers={n_layers}, d_source={d_source})"
+                )
+            if self.mu_y.shape != (n_layers, d_target):
+                raise ValueError(
+                    f"mu_y shape {tuple(self.mu_y.shape)} does not match (num_layers={n_layers}, d_target={d_target})"
+                )
+        else:
+            raise ValueError(
+                f"PlatoKey weight must be 2D [d_target, d_source] or 3D [num_layers, d_target, d_source], "
+                f"got {tuple(self.weight.shape)}"
+            )
         if self.pooled_weight is not None:
             if self.pooled_mu_x is None or self.pooled_mu_y is None:
                 raise ValueError("pooled_weight requires pooled_mu_x and pooled_mu_y")
             pt, ps = self.pooled_weight.shape
             if self.pooled_mu_x.shape != (ps,) or self.pooled_mu_y.shape != (pt,):
                 raise ValueError("pooled_mu_x / pooled_mu_y shapes do not match pooled_weight")
+        self.meta.num_layers = n_layers
         self.meta.d_source = d_source
         self.meta.d_target = d_target
         self.meta.scale = float(self.scale)
 
     @property
+    def is_multilayer(self) -> bool:
+        return self.weight.ndim == 3
+
+    @property
+    def num_layers(self) -> int:
+        return int(self.weight.shape[0]) if self.weight.ndim == 3 else 1
+
+    @property
     def d_source(self) -> int:
-        return int(self.weight.shape[1])
+        return int(self.weight.shape[-1])
 
     @property
     def d_target(self) -> int:
-        return int(self.weight.shape[0])
+        return int(self.weight.shape[-2])
 
     def summary(self) -> str:
         """Human-readable multi-line summary for inspection nodes and CLI output."""
         m = self.meta
-        lines = [
-            f"PlatoKey ({m.method}) — {self.d_source} -> {self.d_target}",
-        ]
+        dim_str = (
+            f"{self.num_layers}x{self.d_source} -> {self.num_layers}x{self.d_target}"
+            if self.is_multilayer
+            else f"{self.d_source} -> {self.d_target}"
+        )
+        lines = [f"PlatoKey ({m.method}) — {dim_str}"]
         if m.source_model or m.target_model:
             lines.append(f"Models:   {m.source_model or '?'} -> {m.target_model or '?'}")
         if m.target_preset:
@@ -229,6 +270,8 @@ class PlatoKey:
             f"Layers:   source={m.source_layer} (norm={m.source_layer_norm}), "
             f"target={m.target_layer} (norm={m.target_layer_norm})"
         )
+        if m.strip_prefix_mode or m.flatten_layers:
+            lines.append(f"Post:     strip_prefix={m.strip_prefix_mode or 'none'}, flatten_layers={m.flatten_layers}")
         if m.source_template:
             escaped = m.source_template.replace("\n", "\\n")
             lines.append(f"Template: {escaped}")
@@ -267,11 +310,16 @@ def save_key(
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    scale_tensor = (
+        torch.tensor([float(s) for s in key.layer_scales], dtype=torch.float32)
+        if key.layer_scales is not None
+        else torch.tensor([float(key.scale)], dtype=torch.float32)
+    )
     tensors: dict[str, torch.Tensor] = {
         "weight": key.weight.detach().to(device="cpu", dtype=dtype).contiguous(),
         "mu_x": key.mu_x.detach().to(device="cpu", dtype=torch.float32).contiguous(),
         "mu_y": key.mu_y.detach().to(device="cpu", dtype=torch.float32).contiguous(),
-        "scale": torch.tensor([float(key.scale)], dtype=torch.float32),
+        "scale": scale_tensor,
     }
     if key.target_token_rms is not None:
         tensors["target_token_rms"] = torch.tensor([float(key.target_token_rms)], dtype=torch.float32)
@@ -305,7 +353,16 @@ def load_key(path: str | os.PathLike[str]) -> PlatoKey:
         )
 
     meta = PlatoKeyMeta.from_header(header)
-    scale = float(tensors["scale"].item()) if "scale" in tensors else meta.scale
+    layer_scales: list[float] | None = None
+    if "scale" in tensors:
+        s_t = tensors["scale"].reshape(-1)
+        if s_t.numel() > 1:
+            layer_scales = [float(v) for v in s_t.tolist()]
+            scale = float(s_t.mean().item())
+        else:
+            scale = float(s_t.item())
+    else:
+        scale = meta.scale
     target_rms = float(tensors["target_token_rms"].item()) if "target_token_rms" in tensors else None
     source_rms = float(tensors["source_token_rms"].item()) if "source_token_rms" in tensors else None
 
@@ -315,6 +372,7 @@ def load_key(path: str | os.PathLike[str]) -> PlatoKey:
         mu_y=tensors["mu_y"],
         meta=meta,
         scale=scale,
+        layer_scales=layer_scales,
         target_token_rms=target_rms,
         source_token_rms=source_rms,
         pooled_weight=tensors.get("pooled_weight"),

@@ -18,7 +18,7 @@ from functools import lru_cache
 from comfy_api.latest import ComfyExtension, io
 
 from .apply import NORM_MATCH_MODES, NORM_MATCH_OFF, apply_conditioning, compare_conditioning
-from .encode import encode_with_key
+from .encode import encode_with_key, patch_clip_with_key
 from .format import PlatoKey, discover_keys, load_key, resolve_key_path
 
 CATEGORY = "conditioning/plato keys"
@@ -252,6 +252,92 @@ class PlatoKeyApply(io.ComfyNode):
         return io.NodeOutput(mapped)
 
 
+class PlatoKeyPatchCLIP(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id=f"{NAMESPACE}.PatchCLIP",
+            display_name="Patch CLIP (Plato Key)",
+            category=CATEGORY,
+            description=(
+                "Clones a CLIP text encoder and wraps its tokenize/encode path with a PlatoKey so "
+                "any downstream CLIP node (Visual Fusion, Layout Apply, Regions, CLIPTextEncode, "
+                "TextEncodeQwenImageEditPlus, etc.) transparently outputs target-space conditioning."
+            ),
+            inputs=[
+                io.Clip.Input(
+                    "clip",
+                    tooltip="Source text encoder (e.g. qwen3.5_2b or qwen3.5_9b).",
+                ),
+                PlatoKeyType.Input("plato_key"),
+                io.Float.Input(
+                    "contrast",
+                    default=1.0,
+                    min=0.0,
+                    max=3.0,
+                    step=0.05,
+                    advanced=True,
+                    tooltip="Scales deviation from the target mean mu_y. 1.0 = exact calibrated map.",
+                ),
+                io.Float.Input(
+                    "scale_multiplier",
+                    default=1.0,
+                    min=0.0,
+                    max=3.0,
+                    step=0.05,
+                    advanced=True,
+                    tooltip="Global output magnitude multiplier. 1.0 = exact calibrated scale.",
+                ),
+                io.Combo.Input(
+                    "norm_match",
+                    options=list(NORM_MATCH_MODES),
+                    default=NORM_MATCH_OFF,
+                    advanced=True,
+                    tooltip="Optional norm correction after projection.",
+                ),
+                io.Boolean.Input(
+                    "honor_key_template",
+                    default=True,
+                    advanced=True,
+                    tooltip="Apply the key's chat template (when input isn't already templated) and "
+                    "prefix stripping (e.g. Krea 2's system+user prefix strip).",
+                ),
+                io.Boolean.Input(
+                    "honor_key_layer",
+                    default=True,
+                    advanced=True,
+                    tooltip="Extract the key's calibrated hidden layer(s) (e.g. 12-layer stack for "
+                    "Krea 2 or 'last' for MOSS-Image).",
+                ),
+            ],
+            outputs=[
+                io.Clip.Output(display_name="clip"),
+            ],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        clip,
+        plato_key: PlatoKey,
+        contrast: float = 1.0,
+        scale_multiplier: float = 1.0,
+        norm_match: str = NORM_MATCH_OFF,
+        honor_key_template: bool = True,
+        honor_key_layer: bool = True,
+    ) -> io.NodeOutput:
+        patched = patch_clip_with_key(
+            clip,
+            plato_key,
+            contrast=contrast,
+            scale_multiplier=scale_multiplier,
+            norm_match=norm_match,
+            honor_key_template=honor_key_template,
+            honor_key_layer=honor_key_layer,
+        )
+        return io.NodeOutput(patched)
+
+
 class PlatoKeyCompare(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -279,7 +365,7 @@ class PlatoKeyCompare(io.ComfyNode):
         return io.NodeOutput(report)
 
 
-NODES = [PlatoKeyLoad, PlatoKeyEncode, PlatoKeyApply, PlatoKeyCompare]
+NODES = [PlatoKeyLoad, PlatoKeyPatchCLIP, PlatoKeyEncode, PlatoKeyApply, PlatoKeyCompare]
 
 
 class PlatoKeysExtension(ComfyExtension):

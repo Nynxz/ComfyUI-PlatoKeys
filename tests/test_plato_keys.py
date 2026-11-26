@@ -16,8 +16,16 @@ from plato_keys.apply import (
     apply_conditioning,
     apply_tensor,
 )
-from plato_keys.encode import encode_with_key, format_prompt_for_key
+from plato_keys.encode import (
+    encode_with_key,
+    find_krea2_prefix_end,
+    format_prompt_for_key,
+    parse_source_layer,
+    patch_clip_with_key,
+)
 from plato_keys.format import (
+    KREA2_TAP_LAYERS,
+    KREA2_TEMPLATE,
     MOSS_IMAGE_TEMPLATE,
     PlatoKey,
     PlatoKeyMeta,
@@ -40,6 +48,7 @@ from scripts.calibrate import (
     fit_and_export,
     format_prompts,
 )
+from scripts.calibrate_comfy import align_token_sequences, proportional_source_layers
 from scripts.prompt_corpus import build_domain_prompts, load_prompts_from_file
 
 
@@ -493,3 +502,184 @@ def test_calibration_helpers_and_end_to_end_export(tmp_path: Path) -> None:
         assert "content_centered_cosine" in r.key.meta.metrics
     # Also check fit_all_methods directly without PCA
     assert len(fit_all_methods(stats)) == 4
+
+
+def test_multilayer_key_roundtrip_apply_and_krea2_encode(tmp_path: Path) -> None:
+    gen = torch.Generator().manual_seed(2026)
+    n_layers, d_src, d_tgt = 4, 16, 24
+    w = torch.randn((n_layers, d_tgt, d_src), generator=gen)
+    mx = torch.randn((n_layers, d_src), generator=gen)
+    my = torch.randn((n_layers, d_tgt), generator=gen)
+    meta = PlatoKeyMeta(
+        source_model="qwen35_2b",
+        target_model="qwen3vl_4b",
+        target_preset="krea2",
+        method="ridge",
+        source_layer="[1,7,15,23]",
+        target_layer="[2,11,23,35]",
+        source_layer_norm=False,
+        target_layer_norm=False,
+        source_template=KREA2_TEMPLATE,
+        strip_prompt=False,
+        strip_prefix_mode="krea2_user",
+        flatten_layers=True,
+    )
+    key = PlatoKey(weight=w, mu_x=mx, mu_y=my, meta=meta, scale=1.1, layer_scales=[0.9, 1.0, 1.1, 1.4])
+    assert key.is_multilayer and key.num_layers == 4 and key.d_source == 16 and key.d_target == 24
+    assert parse_source_layer(key.meta.source_layer) == [1, 7, 15, 23]
+
+    # Save / load roundtrip
+    out_p = save_key(key, tmp_path / "ml_key.safetensors", dtype=torch.float16)
+    loaded = load_key(out_p)
+    assert loaded.is_multilayer and loaded.num_layers == 4
+    assert loaded.layer_scales == pytest.approx([0.9, 1.0, 1.1, 1.4], rel=1e-5)
+    assert loaded.meta.strip_prefix_mode == "krea2_user"
+    assert loaded.meta.flatten_layers is True
+    assert "4x16 -> 4x24" in loaded.summary()
+
+    # Apply on 4D [B, N, S, d_src] -> flattened [B, S, N*d_tgt]
+    x4d = torch.randn((1, n_layers, 7, d_src), generator=gen)
+    y_flat = apply_tensor(x4d, w, mx, my, flatten_layers=True)
+    assert y_flat.shape == (1, 7, n_layers * d_tgt)
+
+    # Apply on pre-flattened 3D [B, S, N*d_src] gives identical output!
+    x3d = x4d.permute(0, 2, 1, 3).reshape(1, 7, n_layers * d_src)
+    y_from_3d = apply_tensor(x3d, w, mx, my, flatten_layers=True)
+    assert torch.allclose(y_flat, y_from_3d, atol=1e-5)
+
+    # Prefix stripping detects second <|im_start|>user\n for BOTH Qwen3-VL (151644/872) and Qwen3.5 (248045/846)
+    q35_pairs = [(248045, 1.0), (9, 1.0), (248046, 1.0), (198, 1.0), (248045, 1.0), (846, 1.0), (198, 1.0), (42, 1.0)]
+    assert find_krea2_prefix_end(q35_pairs, len(q35_pairs)) == 7
+    q3vl_pairs = [(151644, 1.0), (9, 1.0), (151645, 1.0), (198, 1.0), (151644, 1.0), (872, 1.0), (198, 1.0), (42, 1.0)]
+    assert find_krea2_prefix_end(q3vl_pairs, len(q3vl_pairs)) == 7
+    # Templates without a system turn (2nd <|im_start|> is assistant\n, not user\n) must NOT be stripped
+    moss_pairs = [(248045, 1.0), (846, 1.0), (198, 1.0), (42, 1.0), (248046, 1.0), (198, 1.0), (248045, 1.0), (77091, 1.0), (198, 1.0)]
+    assert find_krea2_prefix_end(moss_pairs, len(moss_pairs)) == 0
+
+    # Single-layer [B, seq, d_src] fed to a multi-layer key gives actionable Patch CLIP hint
+    with pytest.raises(ValueError, match="Patch CLIP"):
+        apply_tensor(torch.randn(1, 7, d_src), w, mx, my, flatten_layers=True)
+
+
+def test_proportional_layers_and_cross_tokenizer_alignment() -> None:
+    assert proportional_source_layers(KREA2_TAP_LAYERS, 36, 36) == KREA2_TAP_LAYERS
+    l24 = proportional_source_layers(KREA2_TAP_LAYERS, 36, 24)
+    assert len(l24) == 12 and all(1 <= v <= 23 for v in l24)
+    l32 = proportional_source_layers(KREA2_TAP_LAYERS, 36, 32)
+    assert len(l32) == 12 and all(1 <= v <= 31 for v in l32)
+
+    # Synthetic cross-tokenizer byte-span alignment:
+    # Source splits "hello world" into ["hel", "lo", " world"] (byte ends: 3, 5, 11) + 2 suffix tokens
+    # Target splits "hello world" into ["hello", " wo", "rld"] (byte ends: 5, 8, 11) + 2 suffix tokens
+    class _FakeTok:
+        def __init__(self, vocab: dict[int, str]):
+            self.vocab = vocab
+
+        def decode(self, ids: list[int], skip_special_tokens: bool = False) -> str:
+            return "".join(self.vocab[i] for i in ids)
+
+    src_tok = _FakeTok({1: "hel", 2: "lo", 3: " world", 90: "<end>", 91: "\n"})
+    tgt_tok = _FakeTok({10: "hello", 11: " wo", 12: "rld", 99: "<end>", 98: "\n"})
+
+    si, ti, cm = align_token_sequences(
+        [1, 2, 3, 90, 91],
+        [10, 11, 12, 99, 98],
+        src_tok,
+        tgt_tok,
+        suffix_tokens=2,
+        same_tokenizer=False,
+    )
+    # Byte ends 5 ("hello") and 11 ("hello world") match, plus the 2 suffix tokens!
+    assert si == [1, 2, 3, 4]
+    assert ti == [0, 2, 3, 4]
+    assert cm == [True, True, False, False]
+
+
+def test_patch_clip_with_key_works_with_multilayer_and_visual_tokens() -> None:
+    """Verify Patch CLIP handles Visual Fusion's pre-templated image tokens, clone(), and no double-apply."""
+
+    class _MultiLayerDummyCLIP:
+        def __init__(self, d_in: int = 16) -> None:
+            self.d_in = d_in
+            self.layer_idx = None
+            self.cond_stage_model = _DummyCondStage()
+            self.last_text: str | None = None
+            self.last_layer = None
+
+        def clone(self) -> _MultiLayerDummyCLIP:
+            c = _MultiLayerDummyCLIP(self.d_in)
+            c.layer_idx = self.layer_idx
+            c.cond_stage_model = self.cond_stage_model
+            return c
+
+        def clip_layer(self, layer_idx: int | None) -> None:
+            self.layer_idx = layer_idx
+
+        def tokenize(self, text: str, images=None):
+            self.last_text = text
+            # Simulate Qwen3.5 system + <|im_start|>user\n (7 prefix tokens) + optional image + prompt
+            pairs: list[tuple] = [
+                (248045, 1.0), (10, 1.0), (248046, 1.0), (198, 1.0),
+                (248045, 1.0), (846, 1.0), (198, 1.0),
+            ]
+            if images:
+                pairs.append(({"type": "image", "data": images[0]}, 1.0))
+            pairs.extend([(42, 1.0), (43, 1.0), (248046, 1.0)])
+            return {"qwen35_2b": [pairs]}
+
+        def encode_from_tokens(self, tokens, return_pooled=False, return_dict=False):
+            self.cond_stage_model.reset_clip_options()
+            inner = self.cond_stage_model.qwen35_2b
+            self.last_layer = inner.layer
+            # Simulate 1 image expanding to 4 visual tokens -> total seq = 7 + 4 + 3 = 14 (or 10 without image)
+            pairs = tokens["qwen35_2b"][0]
+            has_img = any(isinstance(t[0], dict) for t in pairs)
+            seq = 14 if has_img else 10
+            n_taps = len(inner.layer) if isinstance(inner.layer, list) else 1
+            tensor = torch.ones((1, n_taps, seq, self.d_in), dtype=torch.float32) if n_taps > 1 else torch.ones((1, seq, self.d_in))
+            if return_dict:
+                return {"cond": tensor, "pooled_output": None, "attention_mask": torch.ones((1, seq), dtype=torch.long)}
+            return (tensor, None) if return_pooled else tensor
+
+        def encode_from_tokens_scheduled(self, tokens):
+            # Calls self.encode_from_tokens internally — tests that patching NEVER double-applies!
+            d = self.encode_from_tokens(tokens, return_pooled=True, return_dict=True)
+            cond = d.pop("cond")
+            return [[cond, d]]
+
+    n_layers, d_src, d_tgt = 3, 16, 24
+    key = PlatoKey(
+        weight=torch.eye(d_tgt, d_src).unsqueeze(0).repeat(n_layers, 1, 1),
+        mu_x=torch.zeros((n_layers, d_src)),
+        mu_y=torch.zeros((n_layers, d_tgt)),
+        meta=PlatoKeyMeta(
+            source_layer="[1,11,23]",
+            source_layer_norm=False,
+            source_template=KREA2_TEMPLATE,
+            strip_prefix_mode="krea2_user",
+            flatten_layers=True,
+        ),
+    )
+
+    base = _MultiLayerDummyCLIP(d_in=d_src)
+    patched = patch_clip_with_key(base, key)
+    # Cloning a patched CLIP keeps the patch intact!
+    patched2 = patched.clone()
+
+    # 1. Pre-templated Visual Fusion call with an image: template passes through untouched,
+    #    7 prefix tokens stripped -> 14 - 7 = 7 tokens (4 visual + 3 text), projected & flattened to 3*24=72
+    fusion_prompt = KREA2_TEMPLATE.format(prompt="<|vision_start|><|image_pad|><|vision_end|>cat")
+    toks = patched2.tokenize(fusion_prompt, images=["fake_img"])
+    assert patched2.last_text == fusion_prompt
+    cond = patched2.encode_from_tokens_scheduled(toks)
+    assert patched2.last_layer == [1, 11, 23]
+    assert cond[0][0].shape == (1, 7, n_layers * d_tgt)
+    assert "attention_mask" not in cond[0][1]  # all-1 mask dropped like krea2.py
+    # Original CLIP's inner model restored cleanly!
+    assert base.cond_stage_model.qwen35_2b.layer == "hidden"
+
+    # 2. Raw text call (CLIPTextEncode): gets KREA2_TEMPLATE automatically
+    toks_raw = patched.tokenize("a red fox")
+    assert patched.last_text == KREA2_TEMPLATE.format(prompt="a red fox")
+    cond_raw = patched.encode_from_tokens_scheduled(toks_raw)
+    assert cond_raw[0][0].shape == (1, 3, n_layers * d_tgt)
