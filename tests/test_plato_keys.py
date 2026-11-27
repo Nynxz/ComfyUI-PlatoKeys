@@ -742,3 +742,50 @@ def test_compose_keys_and_k_to_1_concat() -> None:
     y_from_flat = apply_tensor(xm.permute(0, 2, 1, 3).reshape(1, 6, 64), w_k1, mx_k1, my_k1)
     assert y_from_4d.shape == (1, 6, 24)
     assert torch.allclose(y_from_4d, y_from_flat, atol=1e-5)
+
+
+def test_target_prefix_suffix_wrapping_and_gemma4_krea2_strip(tmp_path: Path) -> None:
+    from plato_keys.encode import find_krea2_prefix_end
+
+    gen = torch.Generator().manual_seed(77)
+    pref = torch.randn((3, 24), generator=gen)
+    suf = torch.randn((7, 24), generator=gen)
+    key = PlatoKey(
+        weight=torch.randn((24, 16), generator=gen),
+        mu_x=torch.zeros(16),
+        mu_y=torch.zeros(24),
+        meta=PlatoKeyMeta(
+            source_template="<|turn>user\n{prompt}<turn|>\n<|turn>model\n",
+            source_prefix_len=4,
+            source_suffix_len=5,
+        ),
+        target_prefix=pref,
+        target_suffix=suf,
+    )
+    p = save_key(key, tmp_path / "gemma4_wrapped.safetensors", dtype=torch.float32)
+    loaded = load_key(p)
+    assert loaded.target_prefix is not None and loaded.target_suffix is not None
+    assert loaded.meta.source_prefix_len == 4 and loaded.meta.source_suffix_len == 5
+    assert torch.allclose(loaded.target_prefix, pref, atol=1e-5)
+    assert torch.allclose(loaded.target_suffix, suf, atol=1e-5)
+
+    # Non-empty prompt: 4 prefix + 6 body + 5 suffix = 15 tokens -> wrapped to 3 + 6 + 7 = 16 tokens
+    cond_in = [[torch.randn((1, 15, 16), generator=gen), {"attention_mask": torch.ones((1, 15))}]]
+    cond_out = apply_conditioning(cond_in, loaded)
+    assert cond_out[0][0].shape == (1, 16, 24)
+    assert torch.allclose(cond_out[0][0][0, :3], pref, atol=1e-5)
+    assert torch.allclose(cond_out[0][0][0, -7:], suf, atol=1e-5)
+    assert cond_out[0][1]["attention_mask"].shape == (1, 16)
+
+    # Empty prompt: 4 prefix + 0 body + 5 suffix = 9 tokens -> exact 3 + 7 = 10 target template tokens
+    empty_out = apply_conditioning([[torch.randn((1, 9, 16), generator=gen), {}]], loaded)
+    assert empty_out[0][0].shape == (1, 10, 24)
+    assert torch.allclose(empty_out[0][0][0, :3], pref, atol=1e-5)
+    assert torch.allclose(empty_out[0][0][0, 3:], suf, atol=1e-5)
+
+    # Gemma 4 `<bos><|turn>user\n` (IDs [2, 105, 2364, 107]) is recognized for Krea 2 prefix stripping
+    tok_pairs = [(2, 1.0), (105, 1.0), (2364, 1.0), (107, 1.0), (999, 1.0), (106, 1.0)]
+    assert find_krea2_prefix_end(tok_pairs, seq_len=6) == 4
+    # Already-templated Gemma 4 prompt isn't double-wrapped
+    already = "<|turn>user\nhi<turn|>\n<|turn>model\n"
+    assert format_prompt_for_key(already, loaded) == already

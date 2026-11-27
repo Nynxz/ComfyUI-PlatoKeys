@@ -32,7 +32,7 @@ _NEWLINE_ID = 198
 
 def format_prompt_for_key(text: str, key: PlatoKey, *, honor_template: bool = True) -> str:
     """Apply the key's calibrated chat template if configured and not already templated."""
-    if text.lstrip().startswith("<|im_start|>"):
+    if text.lstrip().startswith(("<|im_start|>", "<|turn>")):
         return text
     prompt = text.strip() if key.meta.strip_prompt else text
     template = key.meta.source_template if honor_template else ""
@@ -187,6 +187,19 @@ def find_krea2_prefix_end(token_pairs: list[tuple[Any, ...]], seq_len: int) -> i
             and int(t2) == _NEWLINE_ID
         ):
             return template_end + 3
+    # Gemma 4 `<bos><|turn>user\n` (IDs [2, 105, 2364, 107]) prefix detection for Krea 2
+    for i in range(min(4, len(token_pairs) - 2)):
+        t0, t1, t2 = token_pairs[i][0], token_pairs[i + 1][0], token_pairs[i + 2][0]
+        if (
+            isinstance(t0, numbers.Integral)
+            and isinstance(t1, numbers.Integral)
+            and isinstance(t2, numbers.Integral)
+            and int(t0) == 105
+            and int(t1) == 2364
+            and int(t2) == 107
+            and seq_len > (i + 3)
+        ):
+            return i + 3
     return 0
 
 

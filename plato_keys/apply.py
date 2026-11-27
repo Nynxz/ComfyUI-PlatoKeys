@@ -183,6 +183,30 @@ def apply_conditioning(
             flatten_layers=key.meta.flatten_layers,
         )
         new_meta = dict(meta) if meta else {}
+        if mapped.ndim == 3 and (key.target_prefix is not None or key.target_suffix is not None):
+            p_src = max(0, int(key.meta.source_prefix_len))
+            s_src = max(0, int(key.meta.source_suffix_len))
+            end_idx = mapped.shape[1] - s_src if s_src > 0 else mapped.shape[1]
+            body = mapped[:, p_src : max(p_src, end_idx), :]
+            parts: list[torch.Tensor] = []
+            b_size = mapped.shape[0]
+            if key.target_prefix is not None:
+                tp = key.target_prefix.to(device=mapped.device, dtype=mapped.dtype)
+                if tp.ndim == 2:
+                    tp = tp.unsqueeze(0)
+                parts.append(tp.expand(b_size, -1, -1))
+            parts.append(body)
+            if key.target_suffix is not None:
+                ts = key.target_suffix.to(device=mapped.device, dtype=mapped.dtype)
+                if ts.ndim == 2:
+                    ts = ts.unsqueeze(0)
+                parts.append(ts.expand(b_size, -1, -1))
+            mapped = torch.cat(parts, dim=1).contiguous()
+            mask = new_meta.get("attention_mask")
+            if mask is not None and mask.shape[-1] != mapped.shape[1]:
+                new_meta["attention_mask"] = torch.ones(
+                    (mask.shape[0], mapped.shape[1]), dtype=mask.dtype, device=mask.device
+                )
         if transform_pooled and key.pooled_weight is not None:
             pooled = new_meta.get("pooled_output")
             if pooled is not None and pooled.shape[-1] == key.pooled_weight.shape[1]:

@@ -69,6 +69,8 @@ class PlatoKeyMeta:
     source_template: str = ""  # Python format string with `{prompt}`, or "" to use CLIP's default
     strip_prompt: bool = True  # MOSS-Image strips leading/trailing whitespace before templating
     strip_prefix_mode: str = ""  # "" (none) or "krea2_user" (strip system + <|im_start|>user\n prefix)
+    source_prefix_len: int = 0   # Optional source prefix token count stripped before wrapping `target_prefix`
+    source_suffix_len: int = 0   # Optional source suffix token count stripped before wrapping `target_suffix`
     flatten_layers: bool = False  # True for multi-layer DiTs like Krea 2: [B, N, S, D] -> [B, S, N*D]
     num_layers: int = 1  # 1 for single-layer keys, >1 for stacked per-layer keys (e.g. 12 for Krea 2)
     d_source: int = 0
@@ -171,6 +173,8 @@ class PlatoKeyMeta:
             source_template=str(_get("source_template", "")),
             strip_prompt=_bool("strip_prompt", True),
             strip_prefix_mode=str(_get("strip_prefix_mode", "")),
+            source_prefix_len=_int("source_prefix_len", 0),
+            source_suffix_len=_int("source_suffix_len", 0),
             flatten_layers=_bool("flatten_layers", False),
             num_layers=_int("num_layers", 1),
             d_source=_int("d_source", 0),
@@ -202,6 +206,8 @@ class PlatoKey:
     pooled_weight: torch.Tensor | None = None  # [d_pooled_target, d_pooled_source]
     pooled_mu_x: torch.Tensor | None = None  # [d_pooled_source]
     pooled_mu_y: torch.Tensor | None = None  # [d_pooled_target]
+    target_prefix: torch.Tensor | None = None  # [P, d_target] exact target attention-sink prefix (e.g. MOSS 3-tok)
+    target_suffix: torch.Tensor | None = None  # [T, d_target] exact target turn-closing suffix (e.g. MOSS 7-tok)
 
     def __post_init__(self) -> None:
         if self.weight.ndim == 2:
@@ -329,6 +335,10 @@ def save_key(
         tensors["pooled_weight"] = key.pooled_weight.detach().to(device="cpu", dtype=dtype).contiguous()
         tensors["pooled_mu_x"] = key.pooled_mu_x.detach().to(device="cpu", dtype=torch.float32).contiguous()
         tensors["pooled_mu_y"] = key.pooled_mu_y.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    if key.target_prefix is not None:
+        tensors["target_prefix"] = key.target_prefix.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    if key.target_suffix is not None:
+        tensors["target_suffix"] = key.target_suffix.detach().to(device="cpu", dtype=torch.float32).contiguous()
 
     save_file(tensors, str(out_path), metadata=key.meta.to_header())
     return out_path
@@ -378,6 +388,8 @@ def load_key(path: str | os.PathLike[str]) -> PlatoKey:
         pooled_weight=tensors.get("pooled_weight"),
         pooled_mu_x=tensors.get("pooled_mu_x"),
         pooled_mu_y=tensors.get("pooled_mu_y"),
+        target_prefix=tensors.get("target_prefix"),
+        target_suffix=tensors.get("target_suffix"),
     )
 
 
