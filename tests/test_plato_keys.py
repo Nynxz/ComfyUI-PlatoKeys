@@ -683,3 +683,62 @@ def test_patch_clip_with_key_works_with_multilayer_and_visual_tokens() -> None:
     assert patched.last_text == KREA2_TEMPLATE.format(prompt="a red fox")
     cond_raw = patched.encode_from_tokens_scheduled(toks_raw)
     assert cond_raw[0][0].shape == (1, 3, n_layers * d_tgt)
+
+
+def test_compose_keys_and_k_to_1_concat() -> None:
+    """Verify exact analytical composition (Platonic Hub) and K->1 concatenated multi-layer apply."""
+    from plato_keys.math import compose_keys
+
+    gen = torch.Generator().manual_seed(99)
+    # 1. 2D o 2D composition: A(16) -> Hub(32) -> B(24)
+    k1 = PlatoKey(
+        weight=torch.randn((32, 16), generator=gen),
+        mu_x=torch.randn(16, generator=gen),
+        mu_y=torch.randn(32, generator=gen),
+        meta=PlatoKeyMeta(source_model="A", target_model="Hub", method="ridge"),
+    )
+    k2 = PlatoKey(
+        weight=torch.randn((24, 32), generator=gen),
+        mu_x=torch.randn(32, generator=gen),
+        mu_y=torch.randn(24, generator=gen),
+        meta=PlatoKeyMeta(source_model="Hub", target_model="B", method="ridge"),
+    )
+    comp = compose_keys(k1, k2)
+    x = torch.randn((2, 5, 16), generator=gen)
+    y_seq = apply_tensor(apply_tensor(x, k1.weight, k1.mu_x, k1.mu_y), k2.weight, k2.mu_x, k2.mu_y)
+    y_comp = apply_tensor(x, comp.weight, comp.mu_x, comp.mu_y)
+    assert torch.allclose(y_seq, y_comp, atol=1e-4)
+    assert comp.meta.source_model == "A" and comp.meta.target_model == "B"
+
+    # 2. 3D o 3D composition (multi-layer Hub): 4x16 -> 4x32 -> 4x24
+    mk1 = PlatoKey(
+        weight=torch.randn((4, 32, 16), generator=gen),
+        mu_x=torch.randn((4, 16), generator=gen),
+        mu_y=torch.randn((4, 32), generator=gen),
+    )
+    mk2 = PlatoKey(
+        weight=torch.randn((4, 24, 32), generator=gen),
+        mu_x=torch.randn((4, 32), generator=gen),
+        mu_y=torch.randn((4, 24), generator=gen),
+        meta=PlatoKeyMeta(flatten_layers=True),
+    )
+    mcomp = compose_keys(mk1, mk2)
+    xm = torch.randn((1, 4, 6, 16), generator=gen)
+    ym_seq = apply_tensor(
+        apply_tensor(xm, mk1.weight, mk1.mu_x, mk1.mu_y, flatten_layers=False),
+        mk2.weight,
+        mk2.mu_x,
+        mk2.mu_y,
+        flatten_layers=True,
+    )
+    ym_comp = apply_tensor(xm, mcomp.weight, mcomp.mu_x, mcomp.mu_y, flatten_layers=True)
+    assert torch.allclose(ym_seq, ym_comp, atol=1e-4)
+
+    # 3. K -> 1 concatenated multi-layer source into a single 2D key: [1, 4, 6, 16] -> [1, 6, 24]
+    w_k1 = torch.randn((24, 4 * 16), generator=gen)
+    mx_k1 = torch.randn(4 * 16, generator=gen)
+    my_k1 = torch.randn(24, generator=gen)
+    y_from_4d = apply_tensor(xm, w_k1, mx_k1, my_k1)
+    y_from_flat = apply_tensor(xm.permute(0, 2, 1, 3).reshape(1, 6, 64), w_k1, mx_k1, my_k1)
+    assert y_from_4d.shape == (1, 6, 24)
+    assert torch.allclose(y_from_4d, y_from_flat, atol=1e-5)

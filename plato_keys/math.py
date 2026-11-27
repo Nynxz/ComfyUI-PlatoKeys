@@ -524,3 +524,117 @@ def fit_all_methods(
             key.meta.metrics.update(metrics.to_dict())
         results.append(FitResult(name=name, key=key, metrics=metrics))
     return results
+
+
+@torch.no_grad()
+def compose_keys(first: PlatoKey, second: PlatoKey) -> PlatoKey:
+    """Analytically compose two PlatoKeys `first: A -> Hub` and `second: Hub -> B` into `A -> B`.
+
+    Given:
+      h = mu_h1 + W1 (x - mu_x)
+      y = mu_y  + W2 (h - mu_h2)
+    their exact composition is a single affine map with zero runtime overhead:
+      y = (mu_y + W2 (mu_h1 - mu_h2)) + (W2 W1) (x - mu_x)
+
+    Supports:
+      - 2D o 2D: `[d_B, d_H] @ [d_H, d_A] -> [d_B, d_A]`
+      - 3D o 3D: `[N, d_B, d_H] @ [N, d_H, d_A] -> [N, d_B, d_A]` (per-layer hub)
+      - 2D o 3D (flattened): `[d_B, N*d_H]` composed with `[N, d_H, d_A]` -> `[d_B, N*d_A]`
+    """
+    w1 = first.weight.detach().to(device="cpu", dtype=torch.float64)
+    mx1 = first.mu_x.detach().to(device="cpu", dtype=torch.float64)
+    my1 = first.mu_y.detach().to(device="cpu", dtype=torch.float64)
+
+    w2 = second.weight.detach().to(device="cpu", dtype=torch.float64)
+    mx2 = second.mu_x.detach().to(device="cpu", dtype=torch.float64)
+    my2 = second.mu_y.detach().to(device="cpu", dtype=torch.float64)
+
+    layer_scales: list[float] | None = None
+    if w1.ndim == 2 and w2.ndim == 2:
+        if w1.shape[0] != w2.shape[1]:
+            raise ValueError(
+                f"Cannot compose 2D PlatoKeys: first target dim {w1.shape[0]} != second source dim {w2.shape[1]}"
+            )
+        w_comp = w2 @ w1
+        mx_comp = mx1
+        my_comp = my2 + w2 @ (my1 - mx2)
+    elif w1.ndim == 3 and w2.ndim == 3:
+        if w1.shape[0] != w2.shape[0] or w1.shape[1] != w2.shape[2]:
+            raise ValueError(
+                f"Cannot compose 3D PlatoKeys: first target shape ({w1.shape[0]}, {w1.shape[1]}) "
+                f"!= second source shape ({w2.shape[0]}, {w2.shape[2]})"
+            )
+        w_comp = torch.bmm(w2, w1)  # [N, d_B, d_A]
+        mx_comp = mx1
+        my_comp = my2 + torch.bmm(w2, (my1 - mx2).unsqueeze(-1)).squeeze(-1)
+        s1 = first.layer_scales or [first.scale] * w1.shape[0]
+        s2 = second.layer_scales or [second.scale] * w2.shape[0]
+        layer_scales = [float(a * b) for a, b in zip(s1, s2, strict=True)]
+    elif w1.ndim == 3 and w2.ndim == 2:
+        n_layers, d_h, d_a = w1.shape
+        if n_layers * d_h != w2.shape[1]:
+            raise ValueError(
+                f"Cannot compose 3D->2D PlatoKeys: flattened first target {n_layers}*{d_h}={n_layers * d_h} "
+                f"!= second source dim {w2.shape[1]}"
+            )
+        # Apply each layer block of W2 ([d_B, N, d_H]) against W1 ([N, d_H, d_A]) -> [d_B, N*d_A]
+        w2_blocks = w2.view(w2.shape[0], n_layers, d_h)
+        w_comp = torch.einsum("bnh,nha->bna", w2_blocks, w1).reshape(w2.shape[0], n_layers * d_a)
+        mx_comp = mx1.reshape(n_layers * d_a)
+        my_comp = my2 + w2 @ (my1.reshape(n_layers * d_h) - mx2)
+    else:
+        raise ValueError(
+            f"Unsupported PlatoKey composition shapes: first={tuple(w1.shape)}, second={tuple(w2.shape)}"
+        )
+
+    pooled_w = pooled_mx = pooled_my = None
+    if (
+        first.pooled_weight is not None
+        and second.pooled_weight is not None
+        and first.pooled_mu_x is not None
+        and first.pooled_mu_y is not None
+        and second.pooled_mu_x is not None
+        and second.pooled_mu_y is not None
+        and first.pooled_weight.shape[0] == second.pooled_weight.shape[1]
+    ):
+        pw1 = first.pooled_weight.detach().to(device="cpu", dtype=torch.float64)
+        pmx1 = first.pooled_mu_x.detach().to(device="cpu", dtype=torch.float64)
+        pmy1 = first.pooled_mu_y.detach().to(device="cpu", dtype=torch.float64)
+        pw2 = second.pooled_weight.detach().to(device="cpu", dtype=torch.float64)
+        pmx2 = second.pooled_mu_x.detach().to(device="cpu", dtype=torch.float64)
+        pmy2 = second.pooled_mu_y.detach().to(device="cpu", dtype=torch.float64)
+        pooled_w = (pw2 @ pw1).to(torch.float32)
+        pooled_mx = pmx1.to(torch.float32)
+        pooled_my = (pmy2 + pw2 @ (pmy1 - pmx2)).to(torch.float32)
+
+    hub_name = first.meta.target_model or second.meta.source_model or "hub"
+    comp_meta = PlatoKeyMeta(
+        source_model=first.meta.source_model,
+        target_model=second.meta.target_model,
+        target_preset=second.meta.target_preset or first.meta.target_preset,
+        method=f"composed({first.meta.method}->{second.meta.method})",
+        source_layer=first.meta.source_layer,
+        target_layer=second.meta.target_layer,
+        source_layer_norm=first.meta.source_layer_norm,
+        target_layer_norm=second.meta.target_layer_norm,
+        source_template=second.meta.source_template or first.meta.source_template,
+        strip_prompt=second.meta.strip_prompt if second.meta.source_template else first.meta.strip_prompt,
+        strip_prefix_mode=second.meta.strip_prefix_mode or first.meta.strip_prefix_mode,
+        flatten_layers=second.meta.flatten_layers,
+        scale=float(first.scale * second.scale),
+        notes=f"Platonic Hub composition via {hub_name}",
+    )
+
+    return PlatoKey(
+        weight=w_comp.to(torch.float32).contiguous(),
+        mu_x=mx_comp.to(torch.float32).contiguous(),
+        mu_y=my_comp.to(torch.float32).contiguous(),
+        meta=comp_meta,
+        scale=float(first.scale * second.scale),
+        layer_scales=layer_scales,
+        source_token_rms=first.source_token_rms,
+        target_token_rms=second.target_token_rms,
+        pooled_weight=pooled_w,
+        pooled_mu_x=pooled_mx,
+        pooled_mu_y=pooled_my,
+    )

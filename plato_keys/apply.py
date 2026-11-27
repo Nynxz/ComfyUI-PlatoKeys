@@ -46,13 +46,18 @@ def apply_tensor(
 
     if weight.ndim == 2:
         _, d_source = weight.shape
-        if tensor.shape[-1] != d_source:
+        # Support K -> 1 concatenated multi-layer source keys: [B, K, S, d_layer] -> [B, S, K*d_layer]
+        if tensor.ndim == 4 and (tensor.shape[1] * tensor.shape[-1]) == d_source:
+            b, k_layers, s, d_layer = tensor.shape
+            x32 = tensor.to(dtype=torch.float32).permute(0, 2, 1, 3).reshape(b, s, k_layers * d_layer)
+        elif tensor.shape[-1] == d_source:
+            x32 = tensor.to(dtype=torch.float32)
+        else:
             raise ValueError(
                 f"PlatoKey expects source embedding dimension {d_source}, but input conditioning has "
                 f"dimension {tensor.shape[-1]} (shape {tuple(tensor.shape)}). "
                 "Check that the wired text encoder matches the key's source model."
             )
-        x32 = tensor.to(dtype=torch.float32)
         w32 = weight.to(device=device, dtype=torch.float32)
         mx32 = mu_x.to(device=device, dtype=torch.float32)
         my32 = mu_y.to(device=device, dtype=torch.float32)

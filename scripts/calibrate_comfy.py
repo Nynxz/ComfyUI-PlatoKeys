@@ -439,6 +439,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--comfy", required=True, help="Path to ComfyUI directory (containing `comfy/`).")
     p.add_argument("--source", required=True, help="Path to source text encoder .safetensors.")
     p.add_argument("--target", required=True, help="Path to target text encoder .safetensors.")
+    p.add_argument("--source-clip-type", type=str, default="qwen_image", help="ComfyUI CLIPType for source.")
+    p.add_argument("--target-clip-type", type=str, default=None, help="ComfyUI CLIPType override for target.")
+    p.add_argument(
+        "--source-layers",
+        type=str,
+        default=None,
+        help="Override source layers: 'last', int, or JSON list like '[12,16,20,23]'.",
+    )
+    p.add_argument(
+        "--target-layers",
+        type=str,
+        default=None,
+        help="Override target layers: 'last', int, or JSON list like '[2,4,7,...,31]'.",
+    )
+    p.add_argument(
+        "--concat-source-layers",
+        action="store_true",
+        help="Concatenate multiple source tap layers along the feature dim into a single K*d_src -> d_tgt key.",
+    )
     p.add_argument("--preset", choices=sorted(COMFY_PRESETS.keys()), default="krea2")
     p.add_argument("--num-prompts", type=int, default=2000)
     p.add_argument("--val-prompts", type=int, default=150)
@@ -487,8 +506,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # --- PASS 1: Load source model, tokenize, inspect layer count ---
         t1 = time.time()
-        print(f"\n[pass 1/2] Loading source CLIP: {args.source}", flush=True)
-        src_clip = _load_comfy_clip(args.source, "qwen_image")
+        print(f"\n[pass 1/2] Loading source CLIP ({args.source_clip_type}): {args.source}", flush=True)
+        src_clip = _load_comfy_clip(args.source, args.source_clip_type)
         src_inner = _inner_clip_models(src_clip.cond_stage_model)[0]
         src_num_layers = int(src_inner.num_layers)
         src_hf_tok = _get_hf_tokenizer(src_clip)
@@ -502,15 +521,26 @@ def main(argv: list[str] | None = None) -> int:
             src_cuts.append(cut)
             src_post_ids.append(ids[cut:])
 
-        # Determine source tap layers (if target is a multi-layer list, match proportionally!)
-        if isinstance(preset.target_layers, list):
+        def _parse_layer_override(raw: str | None) -> str | list[int] | None:
+            if not raw:
+                return None
+            s = raw.strip()
+            if s.lower() == "last":
+                return "last"
+            if s.startswith("["):
+                return [int(v) for v in json.loads(s)]
+            return [int(s)]
+
+        target_layers_eff: str | list[int] = _parse_layer_override(args.target_layers) or preset.target_layers
+        src_override = _parse_layer_override(args.source_layers)
+        if src_override is not None:
+            src_layers: str | list[int] = src_override
+        elif isinstance(target_layers_eff, list):
             # Target Qwen3-VL-4B / 8B has 36 layers for Krea 2
-            assumed_tgt_layers = 36 if preset.name == "krea2" else max(preset.target_layers) + 1
-            src_layers: str | list[int] = proportional_source_layers(
-                preset.target_layers, assumed_tgt_layers, src_num_layers
-            )
+            assumed_tgt_layers = 36 if preset.name == "krea2" else max(target_layers_eff) + 1
+            src_layers = proportional_source_layers(target_layers_eff, assumed_tgt_layers, src_num_layers)
         else:
-            src_layers = preset.target_layers
+            src_layers = target_layers_eff
 
         print(
             f"[pass 1/2] source num_layers={src_num_layers}, source_layers={src_layers}, "
@@ -536,8 +566,9 @@ def main(argv: list[str] | None = None) -> int:
 
         # --- PASS 2: Load target model, align token spans, encode & accumulate stats ---
         t2 = time.time()
-        print(f"\n[pass 2/2] Loading target CLIP: {args.target}", flush=True)
-        tgt_clip = _load_comfy_clip(args.target, preset.clip_type_target)
+        tgt_clip_type = args.target_clip_type or preset.clip_type_target
+        print(f"\n[pass 2/2] Loading target CLIP ({tgt_clip_type}): {args.target}", flush=True)
+        tgt_clip = _load_comfy_clip(args.target, tgt_clip_type)
         tgt_inner = _inner_clip_models(tgt_clip.cond_stage_model)[0]
         tgt_num_layers = int(tgt_inner.num_layers)
         tgt_hf_tok = _get_hf_tokenizer(tgt_clip)
@@ -598,27 +629,39 @@ def main(argv: list[str] | None = None) -> int:
             tgt_full_ids,
             tgt_cuts,
             aligned_tgt_idx,
-            layer_spec=preset.target_layers,
+            layer_spec=target_layers_eff,
             layer_norm=preset.target_layer_norm,
             batch_size=args.batch_size,
             cache_dir=cache_dir,
             tag="tgt",
         )
-        assert n_taps_src == n_taps_tgt, f"Layer tap count mismatch: {n_taps_src} vs {n_taps_tgt}"
-        print(f"[pass 2/2] Target encoding done in {time.time() - t2:.1f}s (taps={n_taps_tgt}, d_target={d_target})", flush=True)
+        concat_src = bool(args.concat_source_layers)
+        if concat_src:
+            assert n_taps_tgt == 1, f"--concat-source-layers requires a single-layer target, got {n_taps_tgt}"
+            d_source_eff = n_taps_src * d_source
+            n_fit_layers = 1
+        else:
+            assert n_taps_src == n_taps_tgt, f"Layer tap count mismatch: {n_taps_src} vs {n_taps_tgt}"
+            d_source_eff = d_source
+            n_fit_layers = n_taps_src
+        print(
+            f"[pass 2/2] Target encoding done in {time.time() - t2:.1f}s "
+            f"(taps={n_taps_tgt}, d_target={d_target}, concat_src={concat_src}, d_source_eff={d_source_eff})",
+            flush=True,
+        )
         _unload_comfy_clip(tgt_clip)
 
         # Stream-join src & tgt chunks into per-layer SufficientStats + val split
-        stats_list = [SufficientStats(d_source, d_target) for _ in range(n_taps_src)]
-        val_x_lists: list[list[torch.Tensor]] = [[] for _ in range(n_taps_src)]
-        val_y_lists: list[list[torch.Tensor]] = [[] for _ in range(n_taps_src)]
+        stats_list = [SufficientStats(d_source_eff, d_target) for _ in range(n_fit_layers)]
+        val_x_lists: list[list[torch.Tensor]] = [[] for _ in range(n_fit_layers)]
+        val_y_lists: list[list[torch.Tensor]] = [[] for _ in range(n_fit_layers)]
         val_cm_list: list[torch.Tensor] = []
 
-        # Cache a few src chunk files at a time (LRU-like simple dict capped at 16 files)
+        # Cache a few src chunk files at a time (LRU-like simple dict capped at 24 files)
         for tgt_file in sorted(cache_dir.glob("tgt_*.pt")):
             tgt_chunk = torch.load(tgt_file, map_location="cpu", weights_only=True)
-            batch_x = [[] for _ in range(n_taps_src)]
-            batch_y = [[] for _ in range(n_taps_src)]
+            batch_x = [[] for _ in range(n_fit_layers)]
+            batch_y = [[] for _ in range(n_fit_layers)]
             train_prompts_in_batch = 0
 
             for pid, y_tensor in tgt_chunk.items():
@@ -629,23 +672,26 @@ def main(argv: list[str] | None = None) -> int:
                     if len(src_chunks) >= 24:
                         src_chunks.clear()
                     src_chunks[src_file] = torch.load(src_file, map_location="cpu", weights_only=True)
-                x_full = src_chunks[src_file][pid]  # [N_taps, len_src_post, d_source]
-                x_sel = x_full[:, aligned_src_idx[pid], :]  # [N_taps, M, d_source]
+                x_full = src_chunks[src_file][pid]  # [N_taps_src, len_src_post, d_source]
+                x_sel = x_full[:, aligned_src_idx[pid], :]  # [N_taps_src, M, d_source]
                 assert x_sel.shape[1] == y_tensor.shape[1]
+                if concat_src:
+                    # [K, M, d_source] -> [1, M, K * d_source]
+                    x_sel = x_sel.permute(1, 0, 2).reshape(1, x_sel.shape[1], -1).contiguous()
 
                 if pid in val_set:
-                    for l_i in range(n_taps_src):
+                    for l_i in range(n_fit_layers):
                         val_x_lists[l_i].append(x_sel[l_i])
                         val_y_lists[l_i].append(y_tensor[l_i])
                     val_cm_list.append(torch.tensor(aligned_content[pid], dtype=torch.bool))
                 else:
-                    for l_i in range(n_taps_src):
+                    for l_i in range(n_fit_layers):
                         batch_x[l_i].append(x_sel[l_i])
                         batch_y[l_i].append(y_tensor[l_i])
                     train_prompts_in_batch += 1
 
             if train_prompts_in_batch > 0:
-                for l_i in range(n_taps_src):
+                for l_i in range(n_fit_layers):
                     stats_list[l_i].update(
                         torch.cat(batch_x[l_i], dim=0),
                         torch.cat(batch_y[l_i], dim=0),
@@ -663,7 +709,7 @@ def main(argv: list[str] | None = None) -> int:
     tgt_label = Path(args.target).stem
     src_layer_str = json.dumps(src_layers) if isinstance(src_layers, list) else str(src_layers)
     tgt_layer_str = (
-        json.dumps(preset.target_layers) if isinstance(preset.target_layers, list) else str(preset.target_layers)
+        json.dumps(target_layers_eff) if isinstance(target_layers_eff, list) else str(target_layers_eff)
     )
 
     base_meta = PlatoKeyMeta(
@@ -677,10 +723,10 @@ def main(argv: list[str] | None = None) -> int:
         source_template=preset.template,
         strip_prompt=preset.strip_prompt,
         strip_prefix_mode=preset.strip_prefix_mode,
-        flatten_layers=preset.flatten_layers,
-        num_layers=n_taps_src,
+        flatten_layers=preset.flatten_layers if not concat_src else False,
+        num_layers=n_fit_layers,
         dataset=dataset_label,
-        notes=f"comfy_native; same_tokenizer={same_tok}; aligned={match_pct:.1f}%",
+        notes=f"comfy_native; same_tokenizer={same_tok}; aligned={match_pct:.1f}%; concat_src={concat_src}",
     )
 
     out_dir = Path(args.out_dir)

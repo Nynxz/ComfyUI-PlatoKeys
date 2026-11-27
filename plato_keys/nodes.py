@@ -20,6 +20,7 @@ from comfy_api.latest import ComfyExtension, io
 from .apply import NORM_MATCH_MODES, NORM_MATCH_OFF, apply_conditioning, compare_conditioning
 from .encode import encode_with_key, patch_clip_with_key
 from .format import PlatoKey, discover_keys, load_key, resolve_key_path
+from .math import compose_keys
 
 CATEGORY = "conditioning/plato keys"
 NAMESPACE = "plato_keys"
@@ -338,6 +339,33 @@ class PlatoKeyPatchCLIP(io.ComfyNode):
         return io.NodeOutput(patched)
 
 
+class PlatoKeyCompose(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id=f"{NAMESPACE}.Compose",
+            display_name="Compose Plato Keys (Hub)",
+            category=CATEGORY,
+            description=(
+                "Analytically composes two PlatoKeys (A -> Hub and Hub -> B) into a single "
+                "zero-overhead A -> B PlatoKey via W = W_2 W_1."
+            ),
+            inputs=[
+                PlatoKeyType.Input("key_a_to_hub", tooltip="First key mapping Source A -> Hub."),
+                PlatoKeyType.Input("key_hub_to_b", tooltip="Second key mapping Hub -> Target B."),
+            ],
+            outputs=[
+                PlatoKeyType.Output(display_name="plato_key"),
+                io.String.Output(display_name="info"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, key_a_to_hub: PlatoKey, key_hub_to_b: PlatoKey) -> io.NodeOutput:
+        composed = compose_keys(key_a_to_hub, key_hub_to_b)
+        return io.NodeOutput(composed, composed.summary())
+
+
 class PlatoKeyCompare(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -365,7 +393,7 @@ class PlatoKeyCompare(io.ComfyNode):
         return io.NodeOutput(report)
 
 
-NODES = [PlatoKeyLoad, PlatoKeyPatchCLIP, PlatoKeyEncode, PlatoKeyApply, PlatoKeyCompare]
+NODES = [PlatoKeyLoad, PlatoKeyCompose, PlatoKeyPatchCLIP, PlatoKeyEncode, PlatoKeyApply, PlatoKeyCompare]
 
 
 class PlatoKeysExtension(ComfyExtension):
